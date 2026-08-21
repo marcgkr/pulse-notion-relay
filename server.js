@@ -12,6 +12,9 @@
    ========================================================================= */
 
 const express = require("express");
+const {
+  Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, BorderStyle
+} = require("docx");
 
 const NOTION_TOKEN = process.env.NOTION_TOKEN;
 const DB_ID = (process.env.NOTION_DATABASE_ID || "").replace(/-/g, "");
@@ -354,6 +357,205 @@ app.post("/submit", async (req, res) => {
   } catch (err) {
     console.error("FAILED", err.message, JSON.stringify(req.body).slice(0, 2000));
     res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/* =========================================================================
+   Export: read a submission back out of Notion and hand it over as a
+   document. Nothing is stored here, it is always rebuilt from the page,
+   so an edit made in Notion shows up in the download.
+   ========================================================================= */
+
+const plain = rich => (rich || []).map(t => t.plain_text || t?.text?.content || "").join("");
+
+async function fetchBlocks(id) {
+  const out = [];
+  let cursor;
+  do {
+    const q = cursor ? `?start_cursor=${cursor}&page_size=100` : "?page_size=100";
+    const r = await notion(`/blocks/${id}/children${q}`, "GET");
+    for (const b of r.results) {
+      out.push(b);
+      if (b.has_children && b.type === "toggle") b._kids = await fetchBlocks(b.id);
+    }
+    cursor = r.has_more ? r.next_cursor : null;
+  } while (cursor);
+  return out;
+}
+
+/* Notion blocks -> a flat list this file can render as HTML or Word */
+function flatten(blocks, depth = 0) {
+  const items = [];
+  for (const b of blocks) {
+    const t = b.type;
+    const text = plain(b[t]?.rich_text);
+    if (t === "divider") { items.push({ kind: "rule" }); continue; }
+    if (t === "heading_2") { items.push({ kind: "h2", text }); continue; }
+    if (t === "heading_3") { items.push({ kind: "h3", text }); continue; }
+    if (t === "callout") { items.push({ kind: "note", text }); continue; }
+    if (t === "toggle") {
+      items.push({ kind: "h4", text });
+      if (b._kids) items.push(...flatten(b._kids, depth + 1));
+      continue;
+    }
+    if (t === "paragraph") {
+      if (!text.trim()) continue;
+      const ann = (b.paragraph.rich_text[0] || {}).annotations || {};
+      items.push({ kind: "p", text, bold: !!ann.bold, private: ann.color === "red" });
+      continue;
+    }
+  }
+  return items;
+}
+
+async function loadSubmission(pageId) {
+  const page = await notion(`/pages/${pageId}`, "GET");
+  const title = (() => {
+    for (const v of Object.values(page.properties)) if (v.type === "title") return plain(v.title);
+    return "Submission";
+  })();
+  const prop = (name) => {
+    const v = page.properties[name];
+    if (!v) return "";
+    if (v.type === "rich_text") return plain(v.rich_text);
+    if (v.type === "select") return v.select?.name || "";
+    if (v.type === "multi_select") return v.multi_select.map(o => o.name).join(", ");
+    if (v.type === "date") return v.date?.start || "";
+    if (v.type === "checkbox") return v.checkbox ? "Yes" : "No";
+    return "";
+  };
+  return {
+    id: pageId, title,
+    client: prop("Client"), submitted: prop("Submitted"), hasPrivate: prop("Has private"),
+    items: flatten(await fetchBlocks(pageId))
+  };
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+async function buildDocx(sub) {
+  const kids = [
+    new Paragraph({ text: sub.title, heading: HeadingLevel.TITLE }),
+    new Paragraph({
+      children: [new TextRun({
+        text: [sub.client && `Client: ${sub.client}`, sub.submitted && `Submitted: ${sub.submitted.slice(0, 10)}`]
+          .filter(Boolean).join("   ·   "),
+        color: "666666", size: 20
+      })],
+      spacing: { after: 300 }
+    })
+  ];
+
+  for (const it of sub.items) {
+    if (it.kind === "rule") {
+      kids.push(new Paragraph({
+        border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: "DDDDDD" } },
+        spacing: { before: 200, after: 200 }
+      }));
+    } else if (it.kind === "h2") {
+      kids.push(new Paragraph({ text: it.text, heading: HeadingLevel.HEADING_1, spacing: { before: 320, after: 140 } }));
+    } else if (it.kind === "h3") {
+      kids.push(new Paragraph({ text: it.text, heading: HeadingLevel.HEADING_2, spacing: { before: 260, after: 120 } }));
+    } else if (it.kind === "h4") {
+      kids.push(new Paragraph({ text: it.text, heading: HeadingLevel.HEADING_3, spacing: { before: 200, after: 100 } }));
+    } else if (it.kind === "note") {
+      kids.push(new Paragraph({
+        children: [new TextRun({ text: it.text, italics: true, color: "8A6D00" })],
+        spacing: { before: 160, after: 160 }
+      }));
+    } else {
+      kids.push(new Paragraph({
+        children: [new TextRun({
+          text: it.text, bold: it.bold,
+          italics: it.private, color: it.private ? "B03030" : undefined
+        })],
+        spacing: { after: it.bold ? 40 : 160 }
+      }));
+    }
+  }
+
+  const doc = new Document({
+    creator: "PULSE Digital",
+    title: sub.title,
+    sections: [{ properties: { page: { margin: { top: 1080, bottom: 1080, left: 1080, right: 1080 } } }, children: kids }]
+  });
+  return Packer.toBuffer(doc);
+}
+
+function renderHtml(sub) {
+  const body = sub.items.map(it => {
+    if (it.kind === "rule") return "<hr>";
+    if (it.kind === "h2") return `<h2>${esc(it.text)}</h2>`;
+    if (it.kind === "h3") return `<h3>${esc(it.text)}</h3>`;
+    if (it.kind === "h4") return `<h4>${esc(it.text)}</h4>`;
+    if (it.kind === "note") return `<p class="note">${esc(it.text)}</p>`;
+    return `<p class="${it.bold ? "q" : ""}${it.private ? " priv" : ""}">${esc(it.text)}</p>`;
+  }).join("\n");
+  return `<!doctype html><meta charset="utf-8"><title>${esc(sub.title)}</title>
+<style>
+ body{max-width:46rem;margin:3rem auto;padding:0 1.25rem;font:16px/1.65 -apple-system,Segoe UI,Roboto,sans-serif;color:#16323d}
+ h1{font-size:2rem;margin:0 0 .2rem} .meta{color:#6b8b91;font-size:.85rem;margin:0 0 2rem}
+ h2{font-size:1.3rem;margin:2.4rem 0 .6rem;color:#175E69} h3{font-size:1.05rem;margin:1.8rem 0 .4rem;color:#399677}
+ h4{font-size:1rem;margin:1.4rem 0 .3rem} hr{border:0;border-top:1px solid #e3ebec;margin:2rem 0}
+ p{margin:0 0 1rem} p.q{font-weight:600;margin-bottom:.15rem}
+ p.priv{color:#b03030;font-style:italic} p.note{background:#fff8e1;padding:.75rem 1rem;border-radius:6px}
+ .bar{margin-bottom:2rem} .bar a{display:inline-block;background:#399677;color:#fff;text-decoration:none;
+   padding:.5rem 1rem;border-radius:6px;font-size:.9rem;margin-right:.5rem}
+ @media print{.bar{display:none}}
+</style>
+<div class="bar"><a href="/export/${sub.id}.docx">Download as Word</a><a href="/export">All submissions</a></div>
+<h1>${esc(sub.title)}</h1>
+<p class="meta">${esc([sub.client && "Client: " + sub.client, sub.submitted && "Submitted: " + sub.submitted.slice(0, 10)].filter(Boolean).join("   ·   "))}</p>
+${body}`;
+}
+
+app.get("/export", async (_req, res) => {
+  try {
+    const q = await notion(`/databases/${DB_ID}/query`, "POST", { page_size: 100 });
+    const rows = q.results.map(pg => {
+      let title = "Untitled";
+      for (const v of Object.values(pg.properties)) if (v.type === "title") title = plain(v.title) || title;
+      const client = pg.properties.Client?.rich_text ? plain(pg.properties.Client.rich_text) : "";
+      const when = pg.properties.Submitted?.date?.start || pg.created_time;
+      return `<tr><td><a href="/export/${pg.id}">${esc(title)}</a></td><td>${esc(client)}</td>
+        <td>${esc((when || "").slice(0, 10))}</td><td><a href="/export/${pg.id}.docx">Word</a></td></tr>`;
+    }).join("\n");
+    res.set("Content-Type", "text/html; charset=utf-8").send(`<!doctype html><meta charset="utf-8">
+<title>Brand Playbook submissions</title>
+<style>body{max-width:52rem;margin:3rem auto;padding:0 1.25rem;font:16px/1.6 -apple-system,Segoe UI,Roboto,sans-serif;color:#16323d}
+h1{color:#175E69} table{width:100%;border-collapse:collapse;margin-top:1.5rem}
+td,th{text-align:left;padding:.6rem .5rem;border-bottom:1px solid #e3ebec;font-size:.95rem}
+th{color:#6b8b91;font-weight:600;font-size:.8rem;text-transform:uppercase;letter-spacing:.04em}
+a{color:#399677}</style>
+<h1>Brand Playbook submissions</h1>
+<table><tr><th>Name</th><th>Client</th><th>Submitted</th><th></th></tr>${rows}</table>`);
+  } catch (e) {
+    res.status(500).send("Could not load submissions: " + esc(e.message));
+  }
+});
+
+app.get("/export/:id.docx", async (req, res) => {
+  try {
+    const sub = await loadSubmission(req.params.id);
+    const buf = await buildDocx(sub);
+    const safe = (sub.title || "submission").replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-") || "submission";
+    res.set({
+      "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "Content-Disposition": `attachment; filename="brand-playbook-${safe}.docx"`
+    }).send(buf);
+  } catch (e) {
+    console.error("Export failed:", e.message);
+    res.status(500).send("Export failed: " + esc(e.message));
+  }
+});
+
+app.get("/export/:id", async (req, res) => {
+  try {
+    res.set("Content-Type", "text/html; charset=utf-8").send(renderHtml(await loadSubmission(req.params.id)));
+  } catch (e) {
+    res.status(500).send("Could not load that submission: " + esc(e.message));
   }
 });
 
