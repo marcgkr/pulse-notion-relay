@@ -16,6 +16,8 @@ const express = require("express");
 const NOTION_TOKEN = process.env.NOTION_TOKEN;
 const DB_ID = (process.env.NOTION_DATABASE_ID || "").replace(/-/g, "");
 const NOTION_VERSION = "2022-06-28";
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || "";
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
 const ALLOWED = (process.env.ALLOWED_ORIGINS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
 
@@ -101,12 +103,88 @@ function para(text, opts = {}) {
 function heading(text) {
   return { object: "block", type: "heading_2", heading_2: { rich_text: rt(text) } };
 }
+function subheading(text) {
+  return { object: "block", type: "heading_3", heading_3: { rich_text: rt(text) } };
+}
 function divider() {
   return { object: "block", type: "divider", divider: {} };
 }
 
+/* ---------- ask Claude for a client summary + story angles ---------- */
+const ANALYSIS_BRIEF = `You are a senior content strategist at PULSE Digital, a Singapore performance marketing agency working mostly with medical, aesthetic and professional-services clients.
+
+Below is a personal brand interview a client has just completed. Read it and return your working notes for the team who will turn this into content.
+
+Rules:
+- British / Singapore English. No em dashes. No corporate jargon.
+- Ground everything in what the client actually said. Do not invent facts, numbers, dates or events.
+- Any answer marked PRIVATE is for the team's understanding only. Never build a public angle on one, and never quote one. You may let it inform your read of the person.
+- For healthcare clients keep MOH and HCSA rules in mind: no outcome claims, no patient testimonials, no before-and-after promises.
+- If the interview is too thin to work with, say so plainly rather than padding.
+
+Return ONLY valid JSON, no markdown fences, in exactly this shape:
+{
+  "summary": "Three or four sentences on who this person is, what drives them, and how they come across. Written for a colleague, not for the client.",
+  "voice_note": "One or two sentences on how their content should sound, drawn from how they actually write and what they picked for tone.",
+  "angles": [
+    {
+      "title": "Short name for the angle",
+      "hook": "The opening line or premise, in their voice",
+      "why": "One or two sentences on why this lands and which part of the interview it draws on",
+      "format": "Where it fits, e.g. LinkedIn post, short-form video, founder story page"
+    }
+  ],
+  "handle_with_care": "Anything the team should avoid or tread carefully around, including what the client marked off limits. Empty string if nothing."
+}
+
+Give four angles, ordered strongest first.`;
+
+async function analyse(payload) {
+  if (!ANTHROPIC_KEY) return null;
+
+  /* build a clean transcript, keeping the private flags visible to the model */
+  let transcript = "";
+  let lastSection = null;
+  for (const r of Object.values(payload.responses || {})) {
+    if (!r) continue;
+    let a = Array.isArray(r.answer) ? r.answer.join(", ") : r.answer;
+    if (!a || !String(a).trim()) continue;
+    if (r.section !== lastSection) { transcript += `\n\n## ${r.section}\n`; lastSection = r.section; }
+    transcript += `\nQ: ${r.question}\nA: ${a}\n`;
+  }
+  if (transcript.trim().length < 200) return null;   // too thin to be worth a call
+
+  try {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": ANTHROPIC_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: ANTHROPIC_MODEL,
+        max_tokens: 2000,
+        system: ANALYSIS_BRIEF,
+        messages: [{ role: "user", content: `Client: ${payload.name || payload.client || "unknown"}\n${transcript}` }]
+      })
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j?.error?.message || `HTTP ${r.status}`);
+
+    let text = (j.content || []).filter(b => b.type === "text").map(b => b.text).join("").trim();
+    text = text.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+    const out = JSON.parse(text);
+    if (!out || typeof out.summary !== "string") throw new Error("unexpected shape");
+    return out;
+  } catch (e) {
+    console.error("Analysis failed (page will still be created):", e.message);
+    return null;
+  }
+}
+
 /* ---------- turn the payload into page body blocks ---------- */
-function buildBlocks(p) {
+function buildBlocks(p, analysis) {
   const blocks = [];
 
   blocks.push({
@@ -123,6 +201,48 @@ function buildBlocks(p) {
   });
   blocks.push(divider());
 
+  /* ---- Claude's read of the interview, above the raw answers ---- */
+  if (analysis) {
+    blocks.push(heading("Who we're working with"));
+    blocks.push(para(analysis.summary || ""));
+
+    if (analysis.voice_note) {
+      blocks.push(para("How they should sound", { bold: true }));
+      blocks.push(para(analysis.voice_note));
+    }
+
+    if (Array.isArray(analysis.angles) && analysis.angles.length) {
+      blocks.push(heading("Story angles"));
+      analysis.angles.forEach((a, i) => {
+        blocks.push({
+          object: "block", type: "toggle",
+          toggle: {
+            rich_text: rt(`${i + 1}. ${a.title || "Untitled angle"}`).map(t => ({ ...t, annotations: { bold: true } })),
+            children: [
+              para(`Hook: ${a.hook || ""}`),
+              para(`Why it works: ${a.why || ""}`),
+              para(`Format: ${a.format || ""}`)
+            ]
+          }
+        });
+      });
+    }
+
+    if (analysis.handle_with_care && String(analysis.handle_with_care).trim()) {
+      blocks.push({
+        object: "block", type: "callout",
+        callout: {
+          icon: { emoji: "\u26A0\uFE0F" },
+          color: "yellow_background",
+          rich_text: rt("Handle with care: " + analysis.handle_with_care)
+        }
+      });
+    }
+
+    blocks.push(divider());
+    blocks.push(heading("The interview"));
+  }
+
   const responses = p.responses || {};
   let lastSection = null;
 
@@ -133,7 +253,7 @@ function buildBlocks(p) {
     if (a == null || String(a).trim() === "") continue;
 
     if (r.section && r.section !== lastSection) {
-      blocks.push(heading(r.section));
+      blocks.push(subheading(r.section));
       lastSection = r.section;
     }
     blocks.push(para(r.question || id, { bold: true }));
@@ -147,7 +267,7 @@ function buildBlocks(p) {
 }
 
 /* ---------- map the flat fields onto Notion properties ---------- */
-function buildProperties(p) {
+function buildProperties(p, analysis) {
   const ans = id => {
     const r = (p.responses || {})[id];
     if (!r) return "";
@@ -169,6 +289,16 @@ function buildProperties(p) {
     "Has private":      { checkbox: !!p.hasPrivate },
     "Page URL":         { url: p.pageUrl || null }
   };
+
+  /* Claude's read, surfaced in the table so you can scan without opening pages */
+  if (analysis) {
+    if (analysis.summary) wanted["Summary"] = { rich_text: rt(analysis.summary) };
+    if (Array.isArray(analysis.angles) && analysis.angles.length) {
+      wanted["Story angles"] = {
+        rich_text: rt(analysis.angles.map((a, i) => `${i + 1}. ${a.title}`).join("  ·  "))
+      };
+    }
+  }
 
   /* multi-select for the tone-of-voice question */
   const voice = ((p.responses || {}).voice || {}).answer;
@@ -204,11 +334,13 @@ app.post("/submit", async (req, res) => {
   try {
     if (!schema) await loadSchema();
 
-    const blocks = buildBlocks(p);
+    const analysis = await analyse(p);          // null if no key, thin form, or API trouble
+
+    const blocks = buildBlocks(p, analysis);
     const page = await notion("/pages", "POST", {
       parent: { database_id: DB_ID },
       icon: { emoji: "\u{1F5E3}" },
-      properties: buildProperties(p),
+      properties: buildProperties(p, analysis),
       children: blocks.slice(0, 100)
     });
 
