@@ -1,0 +1,17 @@
+{
+  "name": "pulse-notion-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Receives PULSE Brand Playbook submissions and writes them into Notion",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "docx": "^9.7.1",
+    "express": "^4.19.2"
+  }
+}
