@@ -6,9 +6,19 @@
    Env vars required (set these in Railway -> Variables):
      NOTION_TOKEN     ntn_xxxxxxxx        (Notion internal integration secret)
      NOTION_DATABASE_ID  32-char id from the database URL
-     ALLOWED_ORIGINS  https://playbook.pulsedigital.sg,https://pulsedigital.sg
+     ALLOWED_ORIGINS     https://medical.pulsedigital.sg
    Optional:
-     PORT             Railway sets this automatically
+     ANTHROPIC_API_KEY   turns on the summary and story angles
+     ANTHROPIC_MODEL     defaults to claude-sonnet-4-6
+     EXPORT_KEY          password for /export, strongly recommended
+     PORT                Railway sets this automatically
+
+   Routes:
+     POST /submit                the form posts here
+     GET  /health                sanity check
+     GET  /export?key=...        list of every submission
+     GET  /export/<id>?key=...   one full interview in the browser
+     GET  /export/<id>.docx?key=...  the same thing as a Word file
    ========================================================================= */
 
 const express = require("express");
@@ -21,6 +31,7 @@ const DB_ID = (process.env.NOTION_DATABASE_ID || "").replace(/-/g, "");
 const NOTION_VERSION = "2022-06-28";
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || "";
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
+const EXPORT_KEY = process.env.EXPORT_KEY || "";
 const ALLOWED = (process.env.ALLOWED_ORIGINS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
 
@@ -426,6 +437,7 @@ async function loadSubmission(pageId) {
   };
   return {
     id: pageId, title,
+    key: EXPORT_KEY ? `?key=${encodeURIComponent(EXPORT_KEY)}` : "",
     client: prop("Client"), submitted: prop("Submitted"), hasPrivate: prop("Has private"),
     items: flatten(await fetchBlocks(pageId))
   };
@@ -505,22 +517,36 @@ function renderHtml(sub) {
    padding:.5rem 1rem;border-radius:6px;font-size:.9rem;margin-right:.5rem}
  @media print{.bar{display:none}}
 </style>
-<div class="bar"><a href="/export/${sub.id}.docx">Download as Word</a><a href="/export">All submissions</a></div>
+<div class="bar"><a href="/export/${sub.id}.docx${sub.key}">Download as Word</a><a href="/export${sub.key}">All submissions</a></div>
 <h1>${esc(sub.title)}</h1>
 <p class="meta">${esc([sub.client && "Client: " + sub.client, sub.submitted && "Submitted: " + sub.submitted.slice(0, 10)].filter(Boolean).join("   ·   "))}</p>
 ${body}`;
 }
 
-app.get("/export", async (_req, res) => {
+/* Everything under /export is client interview material, including the
+   answers they marked private. Set EXPORT_KEY in Railway and the pages are
+   only reachable with ?key=... on the end. Leave it unset and they are open
+   to anyone who knows the URL. */
+app.use("/export", (req, res, next) => {
+  if (!EXPORT_KEY) return next();
+  if (req.query.key === EXPORT_KEY) return next();
+  res.status(404).send("Not found");
+});
+
+app.get("/export", async (req, res) => {
+  const k = EXPORT_KEY ? `?key=${encodeURIComponent(EXPORT_KEY)}` : "";
   try {
-    const q = await notion(`/databases/${DB_ID}/query`, "POST", { page_size: 100 });
+    const q = await notion(`/databases/${DB_ID}/query`, "POST", {
+      page_size: 100,
+      sorts: [{ timestamp: "created_time", direction: "descending" }]
+    });
     const rows = q.results.map(pg => {
       let title = "Untitled";
       for (const v of Object.values(pg.properties)) if (v.type === "title") title = plain(v.title) || title;
       const client = pg.properties.Client?.rich_text ? plain(pg.properties.Client.rich_text) : "";
       const when = pg.properties.Submitted?.date?.start || pg.created_time;
-      return `<tr><td><a href="/export/${pg.id}">${esc(title)}</a></td><td>${esc(client)}</td>
-        <td>${esc((when || "").slice(0, 10))}</td><td><a href="/export/${pg.id}.docx">Word</a></td></tr>`;
+      return `<tr><td><a href="/export/${pg.id}${k}">${esc(title)}</a></td><td>${esc(client)}</td>
+        <td>${esc((when || "").slice(0, 10))}</td><td><a href="/export/${pg.id}.docx${k}">Word</a></td></tr>`;
     }).join("\n");
     res.set("Content-Type", "text/html; charset=utf-8").send(`<!doctype html><meta charset="utf-8">
 <title>Brand Playbook submissions</title>
